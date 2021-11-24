@@ -11,3 +11,4 @@ Micro/CircuitPython:
  
  C/C++:
   * [DMA with PIO](https://www.youtube.com/watch?v=OenPIsmKeDI)
+  * [Raspberry Pi Pico SDK API](https://raspberrypi.github.io/pico-sdk-doxygen/index.html)
