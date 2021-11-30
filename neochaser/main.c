@@ -29,14 +29,19 @@
  */
 
 // Settings (general)
-#define DEBUG                   1   // 1 to print, 0 to silence
+#define DEBUG                   0   // 1 to print, 0 to silence
+#define MODE_BUTTON_PIN         16  // Mode button pin
 #define STATUS_LED_PIN          25  // Status LED pin
+#define SENSOR_HEIGHT           200 // Distance (cm) from ground to sensor
+#define SENSE_DISTANCE          700 // Length (cm) of hallway
+#define CUTOFF_DISTANCE         650 // Stop tracking after this distance (cm)
+#define GND_OFFSET              -10 // Offset (cm)
+#define FADE                    3   // Amount of fade each step
+#define DEBOUNCE_DELAY          40000   // Microseconds
 
 // Settings (WS2812b superstrips)
 #define WS2812_PIN_BASE         6   // Which pin to start PIO outputs at
-#define GND_OFFSET              -10 // Offset (cm)
-#define CUTOFF_DISTANCE         650 // Stop tracking after this distance (cm)
-#define NUM_SUPERSTRIPS         2   // Number of chained strips
+#define NUM_SUPERSTRIPS         1   // Number of chained strips
 #define STRIPS_PER_SUPERSTRIP   3   // Number of strips in 1 chained strip
 #define PIXELS_PER_STRIP        150 // Number of pixels in a single strip
 #define PIXELS_PER_METER        60  // Number of pixels per meter in a strip
@@ -101,6 +106,14 @@ typedef enum {
     TFMINI_ERROR_CHKSUM,    // 3
     TFMINI_ERROR_UNKNOWN    // 4
 } TFMiniStatus;
+
+// Operating modes
+typedef enum {
+    MODE_OFF = 0,
+    MODE_CHASE,
+    MODE_ON,
+    NUM_MODES
+} OpMode;
 
 /*******************************************************************************
  * Globals
@@ -445,10 +458,23 @@ int main() {
     absolute_time_t timestamp;
     int64_t time_diff;
     uint16_t fps;
+    float angle;
+    uint8_t mode_btn_reading = 1;
+    uint8_t mode_btn_state = 1;
+    uint8_t mode_btn_state_prev = 1;
+    absolute_time_t last_debounce;
+    uint8_t mode_flag;
+    OpMode mode = MODE_OFF;
+    uint8_t static_disp_flag = 0;
 
     // Initialize status LED pin
     gpio_init(STATUS_LED_PIN);
     gpio_set_dir(STATUS_LED_PIN, GPIO_OUT);
+
+    // Initialize mode button
+    gpio_init(MODE_BUTTON_PIN);
+    gpio_set_dir(MODE_BUTTON_PIN, GPIO_IN);
+    gpio_pull_up(MODE_BUTTON_PIN);
 
     // Initialize serial port(s)
     stdio_init_all();
@@ -483,6 +509,9 @@ int main() {
     }
     show();
 
+    // Calculate angle of sensor
+    angle = atan(SENSE_DISTANCE / SENSOR_HEIGHT);
+
     // Initialize TFMini UART
     tfmini_init();
 
@@ -490,39 +519,100 @@ int main() {
     timestamp = get_absolute_time();
     while (1) {
 
-        // Fade out pixels
-        for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
-            for (int j = 0; j < PIXELS_PER_SUPERSTRIP; j++) {
-                pix = get_pixel(i, j);
-                pix.r = ((int16_t)pix.r - 5) < 0 ? 0 : (pix.r - 5);
-                pix.g = ((int16_t)pix.g - 5) < 0 ? 0 : (pix.g - 5);
-                pix.b = ((int16_t)pix.b - 5) < 0 ? 0 : (pix.b - 5);
-                set_pixel(i, j, pix.r, pix.g, pix.b);
+        // Button debounce
+        mode_btn_reading = gpio_get(MODE_BUTTON_PIN);
+        if (mode_btn_reading != mode_btn_state_prev) {
+            last_debounce = timestamp;
+        }
+        if (absolute_time_diff_us(last_debounce, get_absolute_time()) > 
+            DEBOUNCE_DELAY) {
+            if (mode_btn_reading != mode_btn_state) {
+                mode_btn_state = mode_btn_reading;
+                if (mode_btn_state == 0) {
+                    mode_flag = 1;
+                }
             }
+        }
+        mode_btn_state_prev = mode_btn_state;
+
+        // If mode flag is set, switch to new mode
+        if (mode_flag == 1) {
+            mode++;
+            if (mode == NUM_MODES) {
+                mode = MODE_OFF;
+            }
+            static_disp_flag = 1;
+            mode_flag = 0;
         }
 
         // Check on status of TFMini
         if (tfmini_status != TFMINI_OK) {
+#if DEBUG
             printf("ERROR: TFMini error code: %i\r\n", tfmini_status);
+#endif
         }
+        
+        // Do display stuff depending on mode
+        switch (mode) {
 
-        // Calculate distance from point on floor below TFMini
-        // %%%TODO
-        gnd_dist = tfmini.distance + GND_OFFSET;
+            // Turn off everything
+            case MODE_OFF:
+                for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
+                    for (int j = 0; j < PIXELS_PER_SUPERSTRIP; j++) {
+                        set_pixel(i, j, 0, 0, 0);
+                    }
+                }
+                if (static_disp_flag == 1) {
+                    static_disp_flag = 0;
+                    show();
+                }
+                break;
 
-        // Calculate which pixel is above target
-        pos = (gnd_dist * PIXELS_PER_METER) / CM_PER_M;
+            // Chase animation
+            case MODE_CHASE:
 
-        // Only draw new pixels if within desired range
-        if (gnd_dist <= CUTOFF_DISTANCE) {
-            for (int i = -1; i < 2; i++) {
-                set_pixel(0, pos + i, 50, 50, 255);
-                set_pixel(1, pos + i, 50, 50, 255);
-            }
+                // Fade out pixels
+                for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
+                    for (int j = 0; j < PIXELS_PER_SUPERSTRIP; j++) {
+                        pix = get_pixel(i, j);
+                        pix.r = ((int16_t)pix.r-FADE) < 0 ? 0 : (pix.r-FADE);
+                        pix.g = ((int16_t)pix.g-FADE) < 0 ? 0 : (pix.g-FADE);
+                        pix.b = ((int16_t)pix.b-FADE) < 0 ? 0 : (pix.b-FADE);
+                        set_pixel(i, j, pix.r, pix.g, pix.b);
+                    }
+                }
+                
+                // Calculate distance from point on floor below TFMini
+                gnd_dist = (tfmini.distance * sin(angle)) + GND_OFFSET;
+
+                // Calculate which pixel is above target
+                pos = (gnd_dist * PIXELS_PER_METER) / CM_PER_M;
+
+                // Only draw new pixels if within desired range
+                if (gnd_dist <= CUTOFF_DISTANCE) {
+                    for (int i = -2; i < 3; i++) {
+                        set_pixel(0, pos + i, 50, 50, 255);
+                    }
+                }
+                show();
+                break;
+
+            // Turn all the lights on
+            case MODE_ON:
+                for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
+                    for (int j = 0; j < PIXELS_PER_SUPERSTRIP; j++) {
+                        set_pixel(i, j, 63, 61, 55);
+                    }
+                }
+                if (static_disp_flag == 1) {
+                    static_disp_flag = 0;
+                    show();
+                }
+                break;
+
+            default:
+                break;
         }
-
-        // Update display
-        show();
 
         // Show debugging info
 #if DEBUG
