@@ -20,6 +20,7 @@
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/uart.h"
+#include "hardware/irq.h"
 
 #include "ws2812_parallel.pio.h"
 
@@ -33,6 +34,8 @@
 
 // Settings (WS2812b superstrips)
 #define WS2812_PIN_BASE         6   // Which pin to start PIO outputs at
+#define GND_OFFSET              -10 // Offset (cm)
+#define CUTOFF_DISTANCE         650 // Stop tracking after this distance (cm)
 #define NUM_SUPERSTRIPS         2   // Number of chained strips
 #define STRIPS_PER_SUPERSTRIP   3   // Number of strips in 1 chained strip
 #define PIXELS_PER_STRIP        150 // Number of pixels in a single strip
@@ -44,7 +47,7 @@
 #define BAUD_RATE               115200
 #define UART_TX_PIN             4
 #define UART_RX_PIN             5
-#define TFMINI_TIMEOUT          50000   // Microseconds
+#define TFMINI_TIMEOUT          10000   // Microseconds
 
 // Constants (WS2812b superstrips)
 #define BITS_PER_BYTE           8   // Well, duh.
@@ -55,19 +58,18 @@
 
 // Constants (TFMini Plus)
 #define TFMINI_BUF_LEN          6
-#define TFMINI_OK               0
-#define TFMINI_ERROR            -1
 #define CM_PER_M                100 // Centimeters in a meter
 
 // Calculated values (WS2812b superstrips)
 #define NUM_STRIPS              NUM_SUPERSTRIPS * STRIPS_PER_SUPERSTRIP
 #define NUM_PIXELS              NUM_STRIPS * PIXELS_PER_STRIP
+#define PIXELS_PER_SUPERSTRIP   STRIPS_PER_SUPERSTRIP * PIXELS_PER_STRIP
 #define DMA_CHANNEL_MASK        (1u << DMA_CHANNEL)
 #define DMA_CB_CHANNEL_MASK     (1u << DMA_CB_CHANNEL)
 #define DMA_CHANNELS_MASK       (DMA_CHANNEL_MASK | DMA_CB_CHANNEL_MASK)
 
 /*******************************************************************************
- * Structs
+ * Structs and enums
  */
 
 // Frame buffer pixel format
@@ -91,6 +93,15 @@ typedef struct {
     uint16_t temperature;
 } TFMini;
 
+// TFMini error codes
+typedef enum {
+    TFMINI_OK,              // 0
+    TFMINI_ERROR_TIMEOUT,   // 1
+    TFMINI_ERROR_BUFOVR,    // 2
+    TFMINI_ERROR_CHKSUM,    // 3
+    TFMINI_ERROR_UNKNOWN    // 4
+} TFMiniStatus;
+
 /*******************************************************************************
  * Globals
  */
@@ -105,13 +116,19 @@ static struct semaphore reset_delay_complete_sem;
 alarm_id_t reset_delay_alarm_id;
 
 // Buffer for holding pixel values
-static pixel_t pix_buf[NUM_STRIPS][NUM_PIXELS];
+static pixel_t pix_buf[NUM_STRIPS][PIXELS_PER_STRIP];
 
 // Double buffer containing "bit planes"
 static value_bits_t bit_planes_buf[2][NUM_PIXELS * NUM_COLORS];
 
 // Double buffer pointer
 static uint8_t current = 0;
+
+// Global TFMini buffer and such
+static char tfmini_buf[TFMINI_BUF_LEN];
+static uint8_t tfmini_status;
+static volatile TFMini tfmini;
+static volatile TFMiniStatus tfmini_status = TFMINI_OK;
 
 /*******************************************************************************
  * DMA functions
@@ -189,10 +206,9 @@ void output_strings_dma(value_bits_t *bits, uint value_length) {
 
 // Transform led buffer to "bit planes" (e.g. transpose bits)
 void fill_bit_planes(   value_bits_t *bit_planes, 
-                        pixel_t pix_buf[NUM_STRIPS][NUM_PIXELS], 
+                        pixel_t pix_buf[NUM_STRIPS][PIXELS_PER_STRIP], 
                         uint8_t current) {
     
-    char buf[20];
     uint32_t plane;
 
     // Copy bits in GRB format to bit planes
@@ -207,7 +223,6 @@ void fill_bit_planes(   value_bits_t *bit_planes,
             }
             bit_planes[(3 * pixel) + 0].planes[bit] = plane;
         }
-        sprintf(buf, "0x%08X", plane);
 
         // Transpose red channel
         for (int bit = 0; bit < 8; bit++) {
@@ -232,9 +247,39 @@ void fill_bit_planes(   value_bits_t *bit_planes,
     }
 }
 
+pixel_t get_pixel(  uint8_t superstrip, 
+                    int pixel) {
+    
+    pixel_t pix = {.r = 0, .g = 0, .b = 0};
+    uint32_t strip;
+    uint32_t pos;
+
+    // Check to make sure our indices are not out of bounds
+    if ((superstrip >= NUM_SUPERSTRIPS) || 
+        (pixel >= PIXELS_PER_SUPERSTRIP)) {
+        return pix;
+    }
+
+    // Don't do anything with negative pixel positions
+    if (pixel < 0) {
+        return pix;
+    }
+
+    // Convert to strip and pixel (in that strip)
+    strip = (superstrip * STRIPS_PER_SUPERSTRIP) + (pixel / PIXELS_PER_STRIP);
+    pos = pixel % PIXELS_PER_STRIP;
+
+    // Get values
+    pix.r = pix_buf[strip][pos].r;
+    pix.g = pix_buf[strip][pos].g;
+    pix.b = pix_buf[strip][pos].b;
+
+    return pix;
+}
+
 // Set pixel to give RGB value
 int set_pixel(  uint8_t superstrip, 
-                uint32_t pixel, 
+                int pixel, 
                 uint8_t r, 
                 uint8_t g, 
                 uint8_t b) {
@@ -244,8 +289,13 @@ int set_pixel(  uint8_t superstrip,
 
     // Check to make sure our indices are not out of bounds
     if ((superstrip >= NUM_SUPERSTRIPS) || 
-        (pixel >= (STRIPS_PER_SUPERSTRIP * PIXELS_PER_STRIP))) {
+        (pixel >= PIXELS_PER_SUPERSTRIP)) {
         return WS2812_ERROR;
+    }
+
+    // Ignore negative pixel positions
+    if (pixel < 0) {
+        return WS2812_OK;
     }
 
     // Convert to strip and pixel (in that strip)
@@ -276,29 +326,21 @@ void show() {
  * Custom functions: TFMini Plus control
  */
 
-// State machine to parse UART messages from TFMini
-int tfmini_rx(  char *buf, 
-                uint8_t buf_len_max, 
-                uart_inst_t *uart, 
-                uint32_t timeout_us) {
-    
-    char c;
-    uint8_t state = 0;
-    uint8_t sof_counter = 0;
-    bool receiving = true;
-    uint8_t buf_idx = 0;
-    uint32_t checksum = 0;
-    
-    while (receiving == true) {
+// Interrupt handler
+void on_tfmini_rx() {
 
-        // Wait for RX buffer to have some data, timeout otherwise
-        if (uart_is_readable_within_us(uart, timeout_us) != true){
-            printf("TIMEOUT\r\n");
-            return TFMINI_ERROR;
-        }
+    static uint8_t c;
+    static uint8_t state = 0;
+    static uint8_t sof_counter = 0;
+    static bool receiving = true;
+    static uint8_t buf_idx = 0;
+    static uint32_t checksum = 0;
 
-        // Get character
-        c = uart_getc(uart);
+    // Keep reading from UART while data is available
+    while (uart_is_readable(TFMINI_UART_ID)) {
+
+        // Get a character
+        c = uart_getc(TFMINI_UART_ID);
 
         // State machine to receive frame
         switch(state) {
@@ -313,61 +355,79 @@ int tfmini_rx(  char *buf,
                     state = 1;
                 }
                 break;
-            
+                
             // Fill buffer
             case 1:
-                buf[buf_idx] = c;
+                tfmini_buf[buf_idx] = c;
                 buf_idx++;
-                if (buf_idx > buf_len_max) {
-                    printf("BUFFER OVERFLOW\r\n");
-                    return TFMINI_ERROR;
-                }
-                if (buf_idx >= 6) { // Only 6 bytes in TFMini payload
+                if (buf_idx == TFMINI_BUF_LEN) {
+                    buf_idx = 0;
                     state = 2;
+                } else if (buf_idx > TFMINI_BUF_LEN) {
+                    buf_idx = 0;
+                    tfmini_status = TFMINI_ERROR_BUFOVR;
+                    state = 0;
                 }
                 break;
             
-            // Checksum calculation (lower 8 bits of sum of received bytes)
+            // End of frame
             case 2:
+
+                // Calculate checksum
                 checksum = 0x59 + 0x59; // SOF bytes are static
-                for (int i = 0; i < buf_idx; i++) {
-                    checksum += buf[i];
+                for (int i = 0; i < TFMINI_BUF_LEN; i++) {
+                    checksum += tfmini_buf[i];
                 }
-                if ((checksum & 0xFF) != c) {
-                    printf("BAD CHECKSUM\r\n");
-                    return TFMINI_ERROR;    
+
+                // If last byte of checksum matches rx character, save data
+                if ((checksum & 0xFF) == c) {
+                    tfmini.distance = tfmini_buf[0] + (tfmini_buf[1] << 8);
+                    tfmini.strength = tfmini_buf[2] + (tfmini_buf[3] << 8);
+                    tfmini.temperature = tfmini_buf[4] + (tfmini_buf[5] << 8);
+                    tfmini_status = TFMINI_OK;
                 } else {
-                    state = 0;
-                    receiving = false;
+                    tfmini_status = TFMINI_ERROR_CHKSUM;
                 }
+                state = 0;
                 break;
 
             // Reset state machine if we somehow end up here
             default:
+                tfmini_status = TFMINI_ERROR_UNKNOWN;
                 state = 0;
                 break;
         }
     }
-
-    return TFMINI_OK;
 }
 
-// Update the TFMini struct with all the yummy data
-int tfmini_update(TFMini *tfmini, uart_inst_t *uart, uint32_t timeout_us) {
+void tfmini_init() {
 
-    char buf[TFMINI_BUF_LEN];
+    // Set up our UART with a dummy baud rate
+    uart_init(TFMINI_UART_ID, 2400);
 
-    // Get data
-    if (tfmini_rx( buf, TFMINI_BUF_LEN, uart, timeout_us) != TFMINI_OK) {
-        return TFMINI_ERROR;
-    }
+    // Configure pins with UART functionality
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
 
-    // Parse data
-    tfmini->distance = buf[0] + (buf[1] << 8);
-    tfmini->strength = buf[2] + (buf[3] << 8);
-    tfmini->temperature = buf[4] + (buf[5] << 8);
+    // Calculate the real baud rate from the requested amount
+    uart_set_baudrate(TFMINI_UART_ID, BAUD_RATE);
 
-    return TFMINI_OK;
+    // Disable CTS/RTS
+    uart_set_hw_flow(TFMINI_UART_ID, false, false);
+
+    // Set our data format
+    uart_set_format(TFMINI_UART_ID, 8, 1, UART_PARITY_NONE);
+
+    // Disable FIFOs, as we're handling each received character in an ISR
+    uart_set_fifo_enabled(TFMINI_UART_ID, false);
+
+    // Set up RX interrupt and interrupt handler
+    int UART_IRQ = (TFMINI_UART_ID == uart0 ? UART0_IRQ : UART1_IRQ);
+    irq_set_exclusive_handler(UART_IRQ, on_tfmini_rx);
+    irq_set_enabled(UART_IRQ, true);
+
+    // Enable the UART interrupt (RX only)
+    uart_set_irq_enables(TFMINI_UART_ID, true, false);
 }
 
 /*******************************************************************************
@@ -376,14 +436,15 @@ int tfmini_update(TFMini *tfmini, uart_inst_t *uart, uint32_t timeout_us) {
 
 int main() {
 
-    char buf[20];
     PIO pio;
     int sm;
     uint offset;
-    TFMini tfmini;
-    uint16_t gnd_dist = 0;
-    uint32_t prev_pos = 0;
-    uint32_t pos = 0;
+    int gnd_dist = 0;
+    int pos = 0;
+    pixel_t pix;
+    absolute_time_t timestamp;
+    int64_t time_diff;
+    uint16_t fps;
 
     // Initialize status LED pin
     gpio_init(STATUS_LED_PIN);
@@ -416,54 +477,63 @@ int main() {
 
     // Clear pixel display
     for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
-        for (int j = 0; j < STRIPS_PER_SUPERSTRIP * PIXELS_PER_STRIP; j++) {
+        for (int j = 0; j < PIXELS_PER_SUPERSTRIP; j++) {
             set_pixel(i, j, 0, 0, 0);
         }
     }
     show();
 
     // Initialize TFMini UART
-    uart_init(TFMINI_UART_ID, BAUD_RATE);
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    tfmini.distance = 0;
-    tfmini.strength = 0;
-    tfmini.temperature = 0;
+    tfmini_init();
 
     // Superloop
+    timestamp = get_absolute_time();
     while (1) {
 
-        // Get distance from TFMini
-        if (TFMINI_OK != tfmini_update( &tfmini, 
-                                        TFMINI_UART_ID, 
-                                        TFMINI_TIMEOUT)) {
-            printf("ERROR: Could not receive data from TFMini\r\n");
+        // Fade out pixels
+        for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
+            for (int j = 0; j < PIXELS_PER_SUPERSTRIP; j++) {
+                pix = get_pixel(i, j);
+                pix.r = ((int16_t)pix.r - 5) < 0 ? 0 : (pix.r - 5);
+                pix.g = ((int16_t)pix.g - 5) < 0 ? 0 : (pix.g - 5);
+                pix.b = ((int16_t)pix.b - 5) < 0 ? 0 : (pix.b - 5);
+                set_pixel(i, j, pix.r, pix.g, pix.b);
+            }
+        }
+
+        // Check on status of TFMini
+        if (tfmini_status != TFMINI_OK) {
+            printf("ERROR: TFMini error code: %i\r\n", tfmini_status);
         }
 
         // Calculate distance from point on floor below TFMini
         // %%%TODO
-        gnd_dist = tfmini.distance;
+        gnd_dist = tfmini.distance + GND_OFFSET;
 
         // Calculate which pixel is above target
         pos = (gnd_dist * PIXELS_PER_METER) / CM_PER_M;
+
+        // Only draw new pixels if within desired range
+        if (gnd_dist <= CUTOFF_DISTANCE) {
+            for (int i = -1; i < 2; i++) {
+                set_pixel(0, pos + i, 50, 50, 255);
+                set_pixel(1, pos + i, 50, 50, 255);
+            }
+        }
+
+        // Update display
+        show();
+
+        // Show debugging info
 #if DEBUG
-        printf("Dist: %i cm, Gnd dist: %i cm, Pos:%i\r\n", 
-                tfmini.distance,
-                gnd_dist,
-                pos);
+        time_diff = absolute_time_diff_us(timestamp, get_absolute_time());
+        fps = 1000000 / time_diff;
+        printf("Dist: %i cm, Gnd dist: %i cm, Pos:%i, FPS:%u\r\n", 
+        tfmini.distance,
+        gnd_dist,
+        pos,
+        fps);
+        timestamp = get_absolute_time();
 #endif
-
-        // // Clear previous pixels
-        // %%%TODO: this is causing UART Rx to fail (buf overflow? Missed frames?)
-        // set_pixel(0, prev_pos, 0, 0, 0);
-        // set_pixel(1, prev_pos, 0, 0, 0);
-
-        // // Show current location
-        // set_pixel(0, pos, 0, 0, 255);
-        // set_pixel(1, pos, 0, 0, 255);
-        // show();
-
-        // // Remember previous position
-        // prev_pos = pos;
     }
 }

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
+#include "hardware/irq.h"
 
 // Settings
 #define TFMINI_UART_ID  uart1
@@ -10,36 +11,44 @@
 #define TFMINI_TIMEOUT  10000   // Microseconds
 
 #define TFMINI_BUF_LEN  6
-#define TFMINI_OK       0
-#define TFMINI_ERROR    -1
 
+// Struct to store TFMini received data
 typedef struct {
     uint16_t distance;
     uint16_t strength;
     uint16_t temperature;
 } TFMini;
 
-int tfmini_rx(  char *buf, 
-                uint8_t buf_len_max, 
-                uart_inst_t *uart, 
-                uint32_t timeout_us) {
-    
-    char c;
-    uint8_t state = 0;
-    uint8_t sof_counter = 0;
-    bool receiving = true;
-    uint8_t buf_idx = 0;
-    uint32_t checksum = 0;
-    
-    while (receiving == true) {
+// TFMini error codes
+typedef enum {
+    TFMINI_OK,              // 0
+    TFMINI_ERROR_TIMEOUT,   // 1
+    TFMINI_ERROR_BUFOVR,    // 2
+    TFMINI_ERROR_CHKSUM,    // 3
+    TFMINI_ERROR_UNKNOWN    // 4
+} TFMiniStatus;
 
-        // Wait for RX buffer to have some data, timeout otherwise
-        if (uart_is_readable_within_us(uart, timeout_us) != true){
-            return TFMINI_ERROR;
-        }
+// Global TFMini buffer and struct
+static char tfmini_buf[TFMINI_BUF_LEN];
+static uint8_t tfmini_status;
+static TFMini tfmini;
+static volatile TFMiniStatus tfmini_status = TFMINI_OK;
 
-        // Get character
-        c = uart_getc(uart);
+// Interrupt handler
+void on_tfmini_rx() {
+
+    static uint8_t c;
+    static uint8_t state = 0;
+    static uint8_t sof_counter = 0;
+    static bool receiving = true;
+    static uint8_t buf_idx = 0;
+    static uint32_t checksum = 0;
+
+    // Keep reading from UART while data is available
+    while (uart_is_readable(TFMINI_UART_ID)) {
+
+        // Get a character
+        c = uart_getc(TFMINI_UART_ID);
 
         // State machine to receive frame
         switch(state) {
@@ -54,64 +63,84 @@ int tfmini_rx(  char *buf,
                     state = 1;
                 }
                 break;
-            
+                
             // Fill buffer
             case 1:
-                buf[buf_idx] = c;
+                tfmini_buf[buf_idx] = c;
                 buf_idx++;
-                if (buf_idx > buf_len_max) {
-                    return TFMINI_ERROR;
-                }
-                if (buf_idx >= 6) { // Only 6 bytes in TFMini payload
+                if (buf_idx == TFMINI_BUF_LEN) {
+                    buf_idx = 0;
                     state = 2;
+                } else if (buf_idx > TFMINI_BUF_LEN) {
+                    buf_idx = 0;
+                    tfmini_status = TFMINI_ERROR_BUFOVR;
+                    state = 0;
                 }
                 break;
             
-            // Checksum calculation (lower 8 bits of sum of received bytes)
+            // End of frame
             case 2:
+
+                // Calculate checksum
                 checksum = 0x59 + 0x59; // SOF bytes are static
-                for (int i = 0; i < buf_idx; i++) {
-                    checksum += buf[i];
+                for (int i = 0; i < TFMINI_BUF_LEN; i++) {
+                    checksum += tfmini_buf[i];
                 }
-                if ((checksum & 0xFF) != c) {
-                    return TFMINI_ERROR;    
+
+                // If last byte of checksum matches rx character, save data
+                if ((checksum & 0xFF) == c) {
+                    tfmini.distance = tfmini_buf[0] + (tfmini_buf[1] << 8);
+                    tfmini.strength = tfmini_buf[2] + (tfmini_buf[3] << 8);
+                    tfmini.temperature = tfmini_buf[4] + (tfmini_buf[5] << 8);
+                    tfmini_status = TFMINI_OK;
                 } else {
-                    state = 0;
-                    receiving = false;
+                    tfmini_status = TFMINI_ERROR_CHKSUM;
                 }
+                state = 0;
                 break;
 
             // Reset state machine if we somehow end up here
             default:
+                tfmini_status = TFMINI_ERROR_UNKNOWN;
                 state = 0;
                 break;
         }
     }
-
-    return TFMINI_OK;
 }
 
-// Update the TFMini struct with all the yummy data
-int tfmini_update(TFMini *tfmini, uart_inst_t *uart, uint32_t timeout_us) {
+void tfmini_init() {
 
-    char buf[TFMINI_BUF_LEN];
+    // Set up our UART with a dummy baud rate
+    uart_init(TFMINI_UART_ID, 2400);
 
-    // Get data
-    if (tfmini_rx( buf, TFMINI_BUF_LEN, uart, timeout_us) != TFMINI_OK) {
-        return TFMINI_ERROR;
-    }
+    // Configure pins with UART functionality
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
 
-    // Parse data
-    tfmini->distance = buf[0] + (buf[1] << 8);
-    tfmini->strength = buf[2] + (buf[3] << 8);
-    tfmini->temperature = buf[4] + (buf[5] << 8);
+    // Calculate the real baud rate from the requested amount
+    uart_set_baudrate(TFMINI_UART_ID, BAUD_RATE);
 
-    return TFMINI_OK;
+    // Disable CTS/RTS
+    uart_set_hw_flow(TFMINI_UART_ID, false, false);
+
+    // Set our data format
+    uart_set_format(TFMINI_UART_ID, 8, 1, UART_PARITY_NONE);
+
+    // Disable FIFOs, as we're handling each received character in an ISR
+    uart_set_fifo_enabled(TFMINI_UART_ID, false);
+
+    // Set up RX interrupt and interrupt handler
+    int UART_IRQ = (TFMINI_UART_ID == uart0 ? UART0_IRQ : UART1_IRQ);
+    irq_set_exclusive_handler(UART_IRQ, on_tfmini_rx);
+    irq_set_enabled(UART_IRQ, true);
+
+    // Enable the UART interrupt (RX only)
+    uart_set_irq_enables(TFMINI_UART_ID, true, false);
 }
 
 int main() {
 
-    TFMini tfmini;
+    
     const uint led_pin = 25;
 
     // Initialize LED pin
@@ -123,20 +152,15 @@ int main() {
     printf("TFMini Plus Test\r\n");
 
     // Initialize TFMini UART
-    uart_init(TFMINI_UART_ID, BAUD_RATE);
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    tfmini_init();
+    printf("TFMini initialized\r\n");
 
     // Loop forever
     while (true) {
-        if (TFMINI_OK != tfmini_update( &tfmini, 
-                                        TFMINI_UART_ID, 
-                                        TFMINI_TIMEOUT)) {
-            printf("ERROR: Could not receive data from TFMini\r\n");
+        if (tfmini_status != TFMINI_OK) {
+            printf("TFMINI ERROR: %i\r\n", tfmini_status);
         }
-        printf("Dist: %i\r\n", tfmini.distance);
-        // printf("Str:  %i\r\n", tfmini.strength);
-        // printf("Temp: %i\r\n", tfmini.temperature);
-        // printf("---\r\n");
+        printf("Dist: %i cm\r\n", tfmini.distance);
+        sleep_ms(10);
     }
 }
