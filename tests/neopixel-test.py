@@ -7,7 +7,7 @@ import time
 import neopixel
 
 # Pins
-neo_0_pin = board.GP16
+neo_0_pin = board.GP13
 
 # Number of pixels on each strip (60 LEDs per meter)
 neo_0_num_pixels = 150

@@ -40,7 +40,7 @@
 #define DEBOUNCE_DELAY          40000   // Microseconds
 
 // Settings (WS2812b superstrips)
-#define WS2812_PIN_BASE         6   // Which pin to start PIO outputs at
+#define WS2812_PIN_BASE         13  // Which pin to start PIO outputs at
 #define NUM_SUPERSTRIPS         1   // Number of chained strips
 #define STRIPS_PER_SUPERSTRIP   3   // Number of strips in 1 chained strip
 #define PIXELS_PER_STRIP        150 // Number of pixels in a single strip
