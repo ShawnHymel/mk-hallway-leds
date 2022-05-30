@@ -1,12 +1,47 @@
 /**
- * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ * Hallway LEDs
  *
- * SPDX-License-Identifier: BSD-3-Clause
+ * Cycle through various animations in one (or more) strips of NeoPixels mounted
+ * in a hallway. Uses a TFMini Plus to determine the disctance to the nearest
+ * object. This can provide for some fun, interactive light displays.
+ * 
+ * Pin connections:
+ *   4  - UART TX pin to TFMini Plus
+ *   5  - UART RX pin to TFMini Plus
+ *  13  - NeoPixel data pin
+ *  16  - Mode toggle button pin
  * 
  * Original: https://github.com/raspberrypi/pico-examples/tree/master/pio/ws2812
  * 
  * Modified by: Shawn Hymel
- * Date: November 23, 2021
+ * Date: November 23, 2022
+ * License: BSD-3-Clause
+ * 
+ * Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+ * 
+ * Redistribution and use in source and binary forms, with or without 
+ * modification, are permitted provided that the following conditions are met:
+ * 
+ *  1. Redistributions of source code must retain the above copyright notice, 
+ *     this list of conditions and the following disclaimer.
+ *  2. Redistributions in binary form must reproduce the above copyright notice,
+ *     this list of conditions and the following disclaimer in the documentation
+ *     and/or other materials provided with the distribution.
+ *  3. Neither the name of the copyright holder nor the names of its 
+ *     contributors may be used to endorse or promote products derived from this
+ *     software without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" 
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE 
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE 
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE 
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF 
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS 
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN 
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) 
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE 
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include <stdio.h>
@@ -543,6 +578,7 @@ int main() {
             }
             static_disp_flag = 1;
             mode_flag = 0;
+            pos = 0;
         }
 
         // Check on status of TFMini
