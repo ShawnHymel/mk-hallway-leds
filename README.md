@@ -90,6 +90,8 @@ typedef enum {
 Next, create your animation in the main superloop as a mode under `switch(mode)`. Here's one possible way of implementing our custom runner animation. Note that we use the `pos` variable, which was declared before the superloop. It is used in the `MODE_CHASE` animation, but we can also use it here to remember the position of the on LED.
 
 ```c
+    ...
+
     // Turn all the lights on
     case MODE_ON:
         for (int i = 0; i < NUM_SUPERSTRIPS; i++) {
@@ -131,6 +133,8 @@ Next, create your animation in the main superloop as a mode under `switch(mode)`
 
     default:
         break;
+
+    ...
 ```
 
 ## License
